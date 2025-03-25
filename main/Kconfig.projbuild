@@ -1,5 +1,56 @@
 menu "Example Configuration"
 
+    menu "Trusted MAC Addresses"
+        config ESPNOW_USE_TRUSTED_MACS
+            bool "Use trusted MAC addresses only"
+            default y
+            help
+                Only communicate with predefined trusted MAC addresses.
+
+        config ESPNOW_TRUSTED_MAC_COUNT
+            int "Number of trusted MAC addresses"
+            default 2
+            range 1 5
+            depends on ESPNOW_USE_TRUSTED_MACS
+            help
+                Number of trusted MAC addresses to configure (max 5).
+
+        config ESPNOW_TRUSTED_MAC_1
+            string "Trusted MAC address 1"
+            default "AA:BB:CC:DD:EE:FF"
+            depends on ESPNOW_USE_TRUSTED_MACS && ESPNOW_TRUSTED_MAC_COUNT >= 1
+            help
+                MAC address in format AA:BB:CC:DD:EE:FF
+
+        config ESPNOW_TRUSTED_MAC_2
+            string "Trusted MAC address 2"
+            default "AA:BB:CC:DD:EE:FF"
+            depends on ESPNOW_USE_TRUSTED_MACS && ESPNOW_TRUSTED_MAC_COUNT >= 2
+            help
+                MAC address in format AA:BB:CC:DD:EE:FF
+
+        config ESPNOW_TRUSTED_MAC_3
+            string "Trusted MAC address 3"
+            default "AA:BB:CC:DD:EE:FF"
+            depends on ESPNOW_USE_TRUSTED_MACS && ESPNOW_TRUSTED_MAC_COUNT >= 3
+            help
+                MAC address in format AA:BB:CC:DD:EE:FF
+
+        config ESPNOW_TRUSTED_MAC_4
+            string "Trusted MAC address 4"
+            default "AA:BB:CC:DD:EE:FF"
+            depends on ESPNOW_USE_TRUSTED_MACS && ESPNOW_TRUSTED_MAC_COUNT >= 4
+            help
+                MAC address in format AA:BB:CC:DD:EE:FF
+
+        config ESPNOW_TRUSTED_MAC_5
+            string "Trusted MAC address 5"
+            default "AA:BB:CC:DD:EE:FF"
+            depends on ESPNOW_USE_TRUSTED_MACS && ESPNOW_TRUSTED_MAC_COUNT >= 5
+            help
+                MAC address in format AA:BB:CC:DD:EE:FF
+    endmenu
+
     choice ESPNOW_WIFI_MODE
         prompt "WiFi mode"
         default ESPNOW_WIFI_MODE_STATION

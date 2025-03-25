@@ -33,6 +33,8 @@
 #include <time.h>
 
 static httpd_handle_t server = NULL;
+// Add this global variable to store own MAC address
+static uint8_t s_own_mac[ESP_NOW_ETH_ALEN] = {0};
 
 #define ESPNOW_MAXDELAY 512
 // Fpor power saving
@@ -48,6 +50,192 @@ static uint8_t s_example_broadcast_mac[ESP_NOW_ETH_ALEN] = {0xFF, 0xFF, 0xFF,
 static uint16_t s_example_espnow_seq[EXAMPLE_ESPNOW_DATA_MAX] = {0, 0};
 
 static void example_espnow_deinit(example_espnow_send_param_t *send_param);
+
+// Array to hold trusted MAC addresses
+static uint8_t s_trusted_mac_list[5][ESP_NOW_ETH_ALEN] = {0};
+static int s_trusted_mac_count = 0;
+
+// Function to initialize own MAC address
+static void init_own_mac(void) {
+  esp_err_t ret = esp_wifi_get_mac(ESPNOW_WIFI_IF, s_own_mac);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to get own MAC address, err: %d", ret);
+    // Fall back to efuse MAC if STA MAC is not available
+    esp_efuse_mac_get_default(s_own_mac);
+  }
+  ESP_LOGI(TAG, "Own MAC address: " MACSTR, MAC2STR(s_own_mac));
+}
+
+// Function to check if a MAC address is the device's own
+static bool is_own_mac(const uint8_t *mac_addr) {
+  return (memcmp(mac_addr, s_own_mac, ESP_NOW_ETH_ALEN) == 0);
+}
+
+// Function to parse MAC address string to bytes
+static bool parse_mac_string(const char *mac_str, uint8_t *mac_addr) {
+  if (strlen(mac_str) != 17) { // XX:XX:XX:XX:XX:XX = 17 chars
+    return false;
+  }
+
+  unsigned int values[6] = {0}; // Change to unsigned int instead of uint32_t
+  int ret = sscanf(mac_str, "%x:%x:%x:%x:%x:%x", &values[0], &values[1],
+                   &values[2], &values[3], &values[4], &values[5]);
+
+  if (ret != 6) {
+    return false;
+  }
+
+  for (int i = 0; i < 6; i++) {
+    if (values[i] > 0xFF) {
+      return false;
+    }
+    mac_addr[i] = (uint8_t)values[i];
+  }
+
+  return true;
+}
+
+// Function to load trusted MAC addresses from Kconfig
+static void load_trusted_mac_addresses(void) {
+  s_trusted_mac_count = 0;
+
+#if CONFIG_ESPNOW_USE_TRUSTED_MACS
+  // Initialize own MAC
+  init_own_mac();
+
+  bool found_own_mac = false;
+
+  // Load MAC address 1
+  if (s_trusted_mac_count < CONFIG_ESPNOW_TRUSTED_MAC_COUNT) {
+    if (parse_mac_string(CONFIG_ESPNOW_TRUSTED_MAC_1,
+                         s_trusted_mac_list[s_trusted_mac_count])) {
+      // Check if this is our own MAC
+      if (is_own_mac(s_trusted_mac_list[s_trusted_mac_count])) {
+        ESP_LOGW(TAG, "Trusted MAC 1 is device's own MAC address - will be "
+                      "skipped for sending");
+        found_own_mac = true;
+      }
+
+      ESP_LOGI(TAG, "Trusted MAC %d: " MACSTR, s_trusted_mac_count + 1,
+               MAC2STR(s_trusted_mac_list[s_trusted_mac_count]));
+      s_trusted_mac_count++;
+    } else {
+      ESP_LOGE(TAG, "Invalid MAC address format for Trusted MAC 1");
+    }
+  }
+
+  // Load MAC address 2
+  if (s_trusted_mac_count < CONFIG_ESPNOW_TRUSTED_MAC_COUNT) {
+    if (parse_mac_string(CONFIG_ESPNOW_TRUSTED_MAC_2,
+                         s_trusted_mac_list[s_trusted_mac_count])) {
+      // Check if this is our own MAC
+      if (is_own_mac(s_trusted_mac_list[s_trusted_mac_count])) {
+        ESP_LOGW(TAG, "Trusted MAC 2 is device's own MAC address - will be "
+                      "skipped for sending");
+        found_own_mac = true;
+      }
+
+      ESP_LOGI(TAG, "Trusted MAC %d: " MACSTR, s_trusted_mac_count + 1,
+               MAC2STR(s_trusted_mac_list[s_trusted_mac_count]));
+      s_trusted_mac_count++;
+    } else {
+      ESP_LOGE(TAG, "Invalid MAC address format for Trusted MAC 2");
+    }
+  }
+
+// Load MAC address 3
+#if CONFIG_ESPNOW_TRUSTED_MAC_COUNT >= 3
+  if (s_trusted_mac_count < CONFIG_ESPNOW_TRUSTED_MAC_COUNT) {
+    if (parse_mac_string(CONFIG_ESPNOW_TRUSTED_MAC_4,
+                         s_trusted_mac_list[s_trusted_mac_count])) {
+      // Check if this is our own MAC
+      if (is_own_mac(s_trusted_mac_list[s_trusted_mac_count])) {
+        ESP_LOGW(TAG, "Trusted MAC 3 is device's own MAC address - will be "
+                      "skipped for sending");
+        found_own_mac = true;
+      }
+
+      ESP_LOGI(TAG, "Trusted MAC %d: " MACSTR, s_trusted_mac_count + 1,
+               MAC2STR(s_trusted_mac_list[s_trusted_mac_count]));
+      s_trusted_mac_count++;
+    } else {
+      ESP_LOGE(TAG, "Invalid MAC address format for Trusted MAC 3");
+    }
+  }
+#endif
+
+// Load MAC address 4
+#if CONFIG_ESPNOW_TRUSTED_MAC_COUNT >= 4
+  if (s_trusted_mac_count < CONFIG_ESPNOW_TRUSTED_MAC_COUNT) {
+    if (parse_mac_string(CONFIG_ESPNOW_TRUSTED_MAC_4,
+                         s_trusted_mac_list[s_trusted_mac_count])) {
+      // Check if this is our own MAC
+      if (is_own_mac(s_trusted_mac_list[s_trusted_mac_count])) {
+        ESP_LOGW(TAG, "Trusted MAC 4 is device's own MAC address - will be "
+                      "skipped for sending");
+        found_own_mac = true;
+      }
+
+      ESP_LOGI(TAG, "Trusted MAC %d: " MACSTR, s_trusted_mac_count + 1,
+               MAC2STR(s_trusted_mac_list[s_trusted_mac_count]));
+      s_trusted_mac_count++;
+    } else {
+      ESP_LOGE(TAG, "Invalid MAC address format for Trusted MAC 4");
+    }
+  }
+#endif
+
+// Load MAC address 5
+#if CONFIG_ESPNOW_TRUSTED_MAC_COUNT >= 5
+  if (s_trusted_mac_count < CONFIG_ESPNOW_TRUSTED_MAC_COUNT) {
+    if (parse_mac_string(CONFIG_ESPNOW_TRUSTED_MAC_5,
+                         s_trusted_mac_list[s_trusted_mac_count])) {
+      // Check if this is our own MAC
+      if (is_own_mac(s_trusted_mac_list[s_trusted_mac_count])) {
+        ESP_LOGW(TAG, "Trusted MAC 5 is device's own MAC address - will be "
+                      "skipped for sending");
+        found_own_mac = true;
+      }
+
+      ESP_LOGI(TAG, "Trusted MAC %d: " MACSTR, s_trusted_mac_count + 1,
+               MAC2STR(s_trusted_mac_list[s_trusted_mac_count]));
+      s_trusted_mac_count++;
+    } else {
+      ESP_LOGE(TAG, "Invalid MAC address format for Trusted MAC 5");
+    }
+  }
+#endif
+  if (found_own_mac) {
+    ESP_LOGW(TAG,
+             "Own MAC found in trusted list. This is allowed but sending to "
+             "self will be skipped");
+  }
+
+  ESP_LOGI(TAG, "Loaded %d trusted MAC addresses", s_trusted_mac_count);
+#else
+  ESP_LOGI(TAG, "Trusted MAC addresses feature disabled");
+#endif
+}
+
+// Function to check if a MAC address is in our trusted list
+static bool is_trusted_mac(const uint8_t *mac_addr) {
+#if CONFIG_ESPNOW_USE_TRUSTED_MACS
+  if (s_trusted_mac_count == 0) {
+    return false;
+  }
+
+  for (int i = 0; i < s_trusted_mac_count; i++) {
+    if (memcmp(mac_addr, s_trusted_mac_list[i], ESP_NOW_ETH_ALEN) == 0) {
+      return true;
+    }
+  }
+
+  return false;
+#else
+  // If trusted MACs feature is disabled, accept all
+  return true;
+#endif
+}
 
 static void example_espnow_recv_cb(const esp_now_recv_info_t *recv_info,
                                    const uint8_t *data, int len) {
@@ -192,43 +380,6 @@ static void example_espnow_send_cb(const uint8_t *mac_addr,
   }
 }
 
-// static void example_espnow_recv_cb(const esp_now_recv_info_t *recv_info,
-//                                    const uint8_t *data, int len) {
-//   example_espnow_event_t evt;
-//   example_espnow_event_recv_cb_t *recv_cb = &evt.info.recv_cb;
-//   uint8_t *mac_addr = recv_info->src_addr;
-//   uint8_t *des_addr = recv_info->des_addr;
-//
-//   if (mac_addr == NULL || data == NULL || len <= 0) {
-//     ESP_LOGE(TAG, "Receive cb arg error");
-//     return;
-//   }
-//
-//   if (IS_BROADCAST_ADDR(des_addr)) {
-//     /* If added a peer with encryption before, the receive packets may be
-//      * encrypted as peer-to-peer message or unencrypted over the broadcast
-//      * channel. Users can check the destination address to distinguish it.
-//      */
-//     ESP_LOGD(TAG, "Receive broadcast ESPNOW data");
-//   } else {
-//     ESP_LOGD(TAG, "Receive unicast ESPNOW data");
-//   }
-//
-//   evt.id = EXAMPLE_ESPNOW_RECV_CB;
-//   memcpy(recv_cb->mac_addr, mac_addr, ESP_NOW_ETH_ALEN);
-//   recv_cb->data = malloc(len);
-//   if (recv_cb->data == NULL) {
-//     ESP_LOGE(TAG, "Malloc receive data fail");
-//     return;
-//   }
-//   memcpy(recv_cb->data, data, len);
-//   recv_cb->data_len = len;
-//   if (xQueueSend(s_example_espnow_queue, &evt, ESPNOW_MAXDELAY) != pdTRUE) {
-//     ESP_LOGW(TAG, "Send receive queue fail");
-//     free(recv_cb->data);
-//   }
-// }
-
 /* Parse received ESPNOW data. */
 int example_espnow_data_parse(uint8_t *data, uint16_t data_len, uint8_t *state,
                               uint16_t *seq, uint32_t *magic) {
@@ -281,7 +432,55 @@ static void example_espnow_task(void *pvParameter) {
   bool is_broadcast = false;
   int ret;
 
+  // Make sure to properly cast the parameter at the beginning
+  example_espnow_send_param_t *send_param =
+      (example_espnow_send_param_t *)pvParameter;
+
   vTaskDelay(5000 / portTICK_PERIOD_MS);
+
+#if CONFIG_ESPNOW_USE_TRUSTED_MACS
+  if (s_trusted_mac_count > 0) {
+    ESP_LOGI(TAG, "Start sending unicast data to trusted peers");
+
+    example_espnow_send_param_t *send_param =
+        (example_espnow_send_param_t *)pvParameter;
+
+    // Send to each trusted peer
+    for (int i = 0; i < s_trusted_mac_count; i++) {
+      // Skip sending to our own MAC address
+      if (is_own_mac(s_trusted_mac_list[i])) {
+        ESP_LOGI(TAG, "Skipping sending to own MAC address: " MACSTR,
+                 MAC2STR(s_trusted_mac_list[i]));
+        continue;
+      }
+      // Set destination MAC
+      memcpy(send_param->dest_mac, s_trusted_mac_list[i], ESP_NOW_ETH_ALEN);
+
+      // Prepare data
+      send_param->unicast = true;
+      send_param->broadcast = false;
+      example_espnow_data_prepare(send_param);
+
+      // Send data
+      ESP_LOGI(TAG, "Sending to trusted peer %d: " MACSTR, i + 1,
+               MAC2STR(s_trusted_mac_list[i]));
+
+      if (esp_now_send(send_param->dest_mac, send_param->buffer,
+                       send_param->len) != ESP_OK) {
+        ESP_LOGE(TAG, "Send error to peer %d", i + 1);
+      }
+
+      // Delay between sends
+      vTaskDelay(500 / portTICK_PERIOD_MS);
+    }
+  } else {
+    ESP_LOGW(TAG, "No trusted peers configured, not sending data");
+    example_espnow_deinit(pvParameter);
+    vTaskDelete(NULL);
+    return;
+  }
+#else
+
   ESP_LOGI(TAG, "Start sending broadcast data");
 
   /* Start sending broadcast ESPNOW data. */
@@ -293,12 +492,22 @@ static void example_espnow_task(void *pvParameter) {
     example_espnow_deinit(send_param);
     vTaskDelete(NULL);
   }
+#endif
 
   while (xQueueReceive(s_example_espnow_queue, &evt, portMAX_DELAY) == pdTRUE) {
     switch (evt.id) {
     case EXAMPLE_ESPNOW_SEND_CB: {
       example_espnow_event_send_cb_t *send_cb = &evt.info.send_cb;
+#if CONFIG_ESPNOW_USE_TRUSTED_MACS
+      // Only proceed if this is a trusted MAC
+      if (!is_trusted_mac(send_cb->mac_addr)) {
+        ESP_LOGW(TAG, "Ignoring non-trusted MAC: " MACSTR,
+                 MAC2STR(send_cb->mac_addr));
+        break;
+      }
+#else
       is_broadcast = IS_BROADCAST_ADDR(send_cb->mac_addr);
+#endif
 
       ESP_LOGD(TAG, "Send data to " MACSTR ", status1: %d",
                MAC2STR(send_cb->mac_addr), send_cb->status);
@@ -344,6 +553,15 @@ static void example_espnow_task(void *pvParameter) {
       if (ret == EXAMPLE_ESPNOW_DATA_BROADCAST) {
         ESP_LOGI(TAG, "Receive %dth broadcast data from: " MACSTR ", len: %d",
                  recv_seq, MAC2STR(recv_cb->mac_addr), recv_cb->data_len);
+#if CONFIG_ESPNOW_USE_TRUSTED_MACS
+        // Only process packets from trusted sources
+        if (!is_trusted_mac(recv_cb->mac_addr)) {
+          ESP_LOGW(TAG, "Received data from untrusted source: " MACSTR,
+                   MAC2STR(recv_cb->mac_addr));
+          free(recv_cb->data);
+          break;
+        }
+#endif
 
         /* If MAC address does not exist in peer list, add it to peer list. */
         if (esp_now_is_peer_exist(recv_cb->mac_addr) == false) {
@@ -375,13 +593,14 @@ static void example_espnow_task(void *pvParameter) {
         }
 
         /* If receive broadcast ESPNOW data which indicates that the other
-         * device has received broadcast ESPNOW data and the local magic number
-         * is bigger than that in the received broadcast ESPNOW data, stop
-         * sending broadcast ESPNOW data and start sending unicast ESPNOW data.
+         * device has received broadcast ESPNOW data and the local magic
+         * number is bigger than that in the received broadcast ESPNOW data,
+         * stop sending broadcast ESPNOW data and start sending unicast ESPNOW
+         * data.
          */
         if (recv_state == 1) {
-          /* The device which has the bigger magic number sends ESPNOW data, the
-           * other one receives ESPNOW data.
+          /* The device which has the bigger magic number sends ESPNOW data,
+           * the other one receives ESPNOW data.
            */
           if (send_param->unicast == false && send_param->magic >= recv_magic) {
             ESP_LOGI(TAG, "Start sending unicast data");
@@ -432,7 +651,8 @@ static esp_err_t example_espnow_init(void) {
     return ESP_FAIL;
   }
 
-  /* Initialize ESPNOW and register sending and receiving callback function. */
+  /* Initialize ESPNOW and register sending and receiving callback function.
+   */
   ESP_ERROR_CHECK(esp_now_init());
   ESP_ERROR_CHECK(esp_now_register_send_cb(example_espnow_send_cb));
   ESP_ERROR_CHECK(esp_now_register_recv_cb(example_espnow_recv_cb));
@@ -446,6 +666,30 @@ static esp_err_t example_espnow_init(void) {
   /* Set primary master key only if encryption is enabled */
   ESP_ERROR_CHECK(esp_now_set_pmk((uint8_t *)CONFIG_ESPNOW_PMK));
 #endif
+
+  // Load trusted MAC addresses from Kconfig
+  load_trusted_mac_addresses();
+#if CONFIG_ESPNOW_USE_TRUSTED_MACS
+  // Add each trusted peer
+  for (int i = 0; i < s_trusted_mac_count; i++) {
+    esp_now_peer_info_t *peer = malloc(sizeof(esp_now_peer_info_t));
+    if (peer == NULL) {
+      ESP_LOGE(TAG, "Malloc peer information fail");
+      vSemaphoreDelete(s_example_espnow_queue);
+      esp_now_deinit();
+      return ESP_FAIL;
+    }
+
+    memset(peer, 0, sizeof(esp_now_peer_info_t));
+    peer->channel = CONFIG_ESPNOW_CHANNEL;
+    peer->ifidx = ESPNOW_WIFI_IF;
+    peer->encrypt = false;
+    ESP_LOGI(TAG, "Adding trusted peer %d with encryption disabled", i + 1);
+    memcpy(peer->peer_addr, s_trusted_mac_list[i], ESP_NOW_ETH_ALEN);
+    ESP_ERROR_CHECK(esp_now_add_peer(peer));
+    free(peer);
+  }
+#else
 
   /* Add broadcast peer information to peer list. */
   esp_now_peer_info_t *peer = malloc(sizeof(esp_now_peer_info_t));
@@ -462,6 +706,7 @@ static esp_err_t example_espnow_init(void) {
   memcpy(peer->peer_addr, s_example_broadcast_mac, ESP_NOW_ETH_ALEN);
   ESP_ERROR_CHECK(esp_now_add_peer(peer));
   free(peer);
+#endif
 
   /* Initialize sending parameters. */
   send_param = malloc(sizeof(example_espnow_send_param_t));
@@ -501,7 +746,8 @@ static void example_espnow_deinit(example_espnow_send_param_t *send_param) {
   free(send_param);
   vSemaphoreDelete(s_example_espnow_queue);
 
-  // Instead of esp_now_deinit(), just unregister callbacks to keep WiFi active
+  // Instead of esp_now_deinit(), just unregister callbacks to keep WiFi
+  // active
   esp_now_unregister_send_cb();
   esp_now_unregister_recv_cb();
 
@@ -524,6 +770,8 @@ void app_main(void) {
   // Get MAC address to create unique SSID
   uint8_t mac[6];
   ESP_ERROR_CHECK(esp_efuse_mac_get_default(mac));
+  // Get and store own MAC address (if not already done in example_wifi_init)
+  init_own_mac();
 
   // Create unique SSID with MAC address
   char ssid[32];
