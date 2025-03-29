@@ -26,6 +26,9 @@
 #include "freertos/semphr.h"
 #include "freertos/timers.h"
 #include "lwip/ip4_addr.h"
+#include <stdarg.h>
+#include <stdio.h>
+
 #include "nvs_flash.h"
 #include "web.h"
 #include <assert.h>
@@ -47,6 +50,14 @@ static bool s_peer_discovery_complete = false;
 static uint8_t s_discovered_peers[CONFIG_ESPNOW_MAX_PEERS][ESP_NOW_ETH_ALEN] = {
     0};
 static int s_discovered_peer_count = 0;
+static char s_pcb_name[32] = {0};
+typedef struct {
+  uint8_t mac[ESP_NOW_ETH_ALEN];
+  char pcb_name[MAX_PCB_NAME_LENGTH];
+  bool has_pcb_name;
+} peer_info_t;
+
+static peer_info_t s_peer_info[CONFIG_ESPNOW_MAX_PEERS] = {0};
 
 #define ESPNOW_MAXDELAY 512
 // Fpor power saving
@@ -66,6 +77,65 @@ static void example_espnow_deinit(example_espnow_send_param_t *send_param);
 // Array to hold trusted MAC addresses
 static uint8_t s_trusted_mac_list[5][ESP_NOW_ETH_ALEN] = {0};
 static int s_trusted_mac_count = 0;
+
+const char *get_pcb_name(void) {
+  if (s_pcb_name[0] == '\0') {
+    // Initialize with Kconfig value if not set yet
+    strncpy(s_pcb_name, CONFIG_ESPNOW_PCB_NAME, sizeof(s_pcb_name) - 1);
+    s_pcb_name[sizeof(s_pcb_name) - 1] = '\0'; // Ensure null termination
+  }
+  return s_pcb_name;
+}
+
+// Add two functions for peer PCB name management:
+static void store_peer_pcb_name(const uint8_t *mac_addr, const char *pcb_name) {
+  for (int i = 0; i < s_discovered_peer_count; i++) {
+    if (memcmp(s_peer_info[i].mac, mac_addr, ESP_NOW_ETH_ALEN) == 0) {
+      // Update existing entry
+      strncpy(s_peer_info[i].pcb_name, pcb_name, MAX_PCB_NAME_LENGTH - 1);
+      s_peer_info[i].pcb_name[MAX_PCB_NAME_LENGTH - 1] = '\0';
+      s_peer_info[i].has_pcb_name = true;
+      return;
+    }
+  }
+
+  // Add new entry if we have space
+  if (s_discovered_peer_count < CONFIG_ESPNOW_MAX_PEERS) {
+    memcpy(s_peer_info[s_discovered_peer_count].mac, mac_addr,
+           ESP_NOW_ETH_ALEN);
+    strncpy(s_peer_info[s_discovered_peer_count].pcb_name, pcb_name,
+            MAX_PCB_NAME_LENGTH - 1);
+    s_peer_info[s_discovered_peer_count].pcb_name[MAX_PCB_NAME_LENGTH - 1] =
+        '\0';
+    s_peer_info[s_discovered_peer_count].has_pcb_name = true;
+    // Note: Do not increment s_discovered_peer_count here, as that's managed
+    // elsewhere
+  }
+}
+
+// Modify the example_espnow_data_prepare function to include PCB name:
+void example_espnow_data_prepare(example_espnow_send_param_t *send_param) {
+  example_espnow_data_t *buf = (example_espnow_data_t *)send_param->buffer;
+
+  assert(send_param->len >= sizeof(example_espnow_data_t));
+
+  buf->type = IS_BROADCAST_ADDR(send_param->dest_mac)
+                  ? EXAMPLE_ESPNOW_DATA_BROADCAST
+                  : EXAMPLE_ESPNOW_DATA_UNICAST;
+  buf->state = send_param->state;
+  buf->seq_num = s_example_espnow_seq[buf->type]++;
+  buf->crc = 0;
+  buf->magic = send_param->magic;
+
+  // Add PCB name to the message
+  strncpy(buf->pcb_name, get_pcb_name(), MAX_PCB_NAME_LENGTH - 1);
+  buf->pcb_name[MAX_PCB_NAME_LENGTH - 1] = '\0';
+
+  /* Fill all remaining bytes after the data with random values */
+  esp_fill_random(buf->payload,
+                  send_param->len - sizeof(example_espnow_data_t));
+  buf->crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)buf, send_param->len);
+}
 
 /* ESPNOW sending or receiving callback function is called in WiFi task.
  * Users should not do lengthy operations from this task. Instead, post
@@ -102,6 +172,28 @@ static void init_own_mac(void) {
 // Function to check if a MAC address is the device's own
 static bool is_own_mac(const uint8_t *mac_addr) {
   return (memcmp(mac_addr, s_own_mac, ESP_NOW_ETH_ALEN) == 0);
+}
+
+const char *get_peer_pcb_name(const uint8_t *mac_addr) {
+  static char unknown_peer[32];
+
+  if (is_own_mac(mac_addr)) {
+    return get_pcb_name(); // Return our own PCB name
+  }
+
+  for (int i = 0; i < s_discovered_peer_count; i++) {
+    if (memcmp(s_peer_info[i].mac, mac_addr, ESP_NOW_ETH_ALEN) == 0) {
+      if (s_peer_info[i].has_pcb_name) {
+        return s_peer_info[i].pcb_name;
+      }
+      break;
+    }
+  }
+
+  // If we don't have the PCB name, return the MAC
+  snprintf(unknown_peer, sizeof(unknown_peer), "Unknown-" MACSTR,
+           MAC2STR(mac_addr));
+  return unknown_peer;
 }
 
 // Function to parse MAC address string to bytes
@@ -292,10 +384,19 @@ static void example_espnow_recv_cb(const esp_now_recv_info_t *recv_info,
     ESP_LOGE(TAG, "Receive cb arg error");
     return;
   }
+  // Extract PCB name from the message if it's long enough
+  if (len >= sizeof(example_espnow_data_t)) {
+    example_espnow_data_t *buf = (example_espnow_data_t *)data;
+    // Store the PCB name from the received message
+    store_peer_pcb_name(mac_addr, buf->pcb_name);
+  }
+
+  // Get PCB name for the sender
+  const char *sender_pcb_name = get_peer_pcb_name(mac_addr);
 
   // Print custom message acknowledging receipt
   ESP_LOGI(TAG, "==================================================");
-  ESP_LOGI(TAG, "Message received from: " MACSTR, MAC2STR(mac_addr));
+  ESP_LOGI(TAG, "Message received from: %s", sender_pcb_name);
   ESP_LOGI(TAG, "Message length: %d bytes", len);
   ESP_LOGI(TAG, "Signal strength (RSSI): %d dBm", rssi);
 
@@ -312,11 +413,11 @@ static void example_espnow_recv_cb(const esp_now_recv_info_t *recv_info,
              buf->type == EXAMPLE_ESPNOW_DATA_BROADCAST ? "Broadcast"
                                                         : "Unicast");
     ESP_LOGI(TAG, "Sequence number: %d", buf->seq_num);
+    ESP_LOGI(TAG, "Sender PCB: %s", buf->pcb_name);
 
     if (print_len > 0) {
       char preview[17] = {0}; // +1 for null terminator
       memcpy(preview, buf->payload, print_len);
-      ESP_LOGI(TAG, "Payload preview: %s", preview);
 
       // If you want to print hex values instead (good for binary data)
       ESP_LOGI(TAG, "Payload hex: ");
@@ -428,25 +529,6 @@ int example_espnow_data_parse(uint8_t *data, uint16_t data_len, uint8_t *state,
   return -1;
 }
 
-/* Prepare ESPNOW data to be sent. */
-void example_espnow_data_prepare(example_espnow_send_param_t *send_param) {
-  example_espnow_data_t *buf = (example_espnow_data_t *)send_param->buffer;
-
-  assert(send_param->len >= sizeof(example_espnow_data_t));
-
-  buf->type = IS_BROADCAST_ADDR(send_param->dest_mac)
-                  ? EXAMPLE_ESPNOW_DATA_BROADCAST
-                  : EXAMPLE_ESPNOW_DATA_UNICAST;
-  buf->state = send_param->state;
-  buf->seq_num = s_example_espnow_seq[buf->type]++;
-  buf->crc = 0;
-  buf->magic = send_param->magic;
-  /* Fill all remaining bytes after the data with random values */
-  esp_fill_random(buf->payload,
-                  send_param->len - sizeof(example_espnow_data_t));
-  buf->crc = esp_crc16_le(UINT16_MAX, (uint8_t const *)buf, send_param->len);
-}
-
 static void example_espnow_task(void *pvParameter) {
   example_espnow_event_t evt;
   uint8_t recv_state = 0;
@@ -493,14 +575,14 @@ static void example_espnow_task(void *pvParameter) {
     if (!s_peer_discovery_complete &&
         (current_time - discovery_start_time > ESPNOW_DISCOVERY_TIMEOUT_MS)) {
 
-      ESP_LOGI(TAG, "Peer discovery completed with %d peers found",
-               s_discovered_peer_count);
+      ESP_LOGI(TAG, "[%s] Peer discovery completed with %d peers found",
+               get_pcb_name(), s_discovered_peer_count);
       s_peer_discovery_complete = true;
 
       // If we found any peers, switch to unicast with the first one
       if (s_discovered_peer_count > 0) {
-        ESP_LOGI(TAG, "Switching to unicast mode with peer: " MACSTR,
-                 MAC2STR(s_discovered_peers[0]));
+        ESP_LOGI(TAG, "[%s] Switching to unicast mode with peer: %s",
+                 get_pcb_name(), get_peer_pcb_name(s_discovered_peers[0]));
 
         send_param->broadcast = false;
         send_param->unicast = true;
@@ -640,8 +722,8 @@ static void example_espnow_task(void *pvParameter) {
             // magic.
             if (send_param->unicast == false &&
                 send_param->magic >= recv_magic) {
-              ESP_LOGI(TAG, "Starting unicast communication with " MACSTR,
-                       MAC2STR(recv_cb->mac_addr));
+              ESP_LOGI(TAG, "Starting unicast communication with %s",
+                       get_peer_pcb_name(recv_cb->mac_addr));
 
               send_param->broadcast = false;
               send_param->unicast = true;
@@ -786,6 +868,9 @@ void app_main(void) {
   // Create unique SSID with MAC address
   char ssid[32];
   snprintf(ssid, sizeof(ssid), "ESP-NOW-RSSI-%02X", mac[0]);
+  // Log startup with PCB name
+  ESP_LOGI(TAG, "Starting ESP-NOW device [%s] with MAC: " MACSTR,
+           get_pcb_name(), MAC2STR(s_own_mac));
 
   // Initialize WiFi in APSTA mode
   example_wifi_init();

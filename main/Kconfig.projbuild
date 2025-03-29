@@ -1,91 +1,11 @@
 menu "Example Configuration"
 
-    menu "Trusted MAC Addresses"
-        config ESPNOW_USE_TRUSTED_MACS
-            bool "Use trusted MAC addresses only"
-            default y
-            help
-                Only communicate with predefined trusted MAC addresses.
-
-        config ESPNOW_TRUSTED_MAC_COUNT
-            int "Number of trusted MAC addresses"
-            default 2
-            range 1 5
-            depends on ESPNOW_USE_TRUSTED_MACS
-            help
-                Number of trusted MAC addresses to configure (max 5).
-
-        config ESPNOW_TRUSTED_MAC_1
-            string "Trusted MAC address 1"
-            default "AA:BB:CC:DD:EE:FF"
-            depends on ESPNOW_USE_TRUSTED_MACS && ESPNOW_TRUSTED_MAC_COUNT >= 1
-            help
-                MAC address in format AA:BB:CC:DD:EE:FF
-
-        config ESPNOW_TRUSTED_MAC_2
-            string "Trusted MAC address 2"
-            default "AA:BB:CC:DD:EE:FF"
-            depends on ESPNOW_USE_TRUSTED_MACS && ESPNOW_TRUSTED_MAC_COUNT >= 2
-            help
-                MAC address in format AA:BB:CC:DD:EE:FF
-
-        config ESPNOW_TRUSTED_MAC_3
-            string "Trusted MAC address 3"
-            default "AA:BB:CC:DD:EE:FF"
-            depends on ESPNOW_USE_TRUSTED_MACS && ESPNOW_TRUSTED_MAC_COUNT >= 3
-            help
-                MAC address in format AA:BB:CC:DD:EE:FF
-
-        config ESPNOW_TRUSTED_MAC_4
-            string "Trusted MAC address 4"
-            default "AA:BB:CC:DD:EE:FF"
-            depends on ESPNOW_USE_TRUSTED_MACS && ESPNOW_TRUSTED_MAC_COUNT >= 4
-            help
-                MAC address in format AA:BB:CC:DD:EE:FF
-
-        config ESPNOW_TRUSTED_MAC_5
-            string "Trusted MAC address 5"
-            default "AA:BB:CC:DD:EE:FF"
-            depends on ESPNOW_USE_TRUSTED_MACS && ESPNOW_TRUSTED_MAC_COUNT >= 5
-            help
-                MAC address in format AA:BB:CC:DD:EE:FF
-    endmenu
-
-    choice ESPNOW_WIFI_MODE
-        prompt "WiFi mode"
-        default ESPNOW_WIFI_MODE_STATION
+    config ESPNOW_PCB_NAME
+        string "PCB Identifier Name"
+        default "ESP32-PCB"
         help
-            WiFi mode(station or softap).
-
-        config ESPNOW_WIFI_MODE_STATION
-            bool "Station"
-        config ESPNOW_WIFI_MODE_STATION_SOFTAP
-            bool "Softap"
-    endchoice
-
-    config ESPNOW_ENABLE_ENCRYPTION
-        bool "Enable Encryption"
-        default "n"
-        help
-            Enable or disable encryption for ESP-NOW communication. When disabled, 
-            communication will be unencrypted for better performance and lower power 
-            consumption, but less secure.
-
-    if ESPNOW_ENABLE_ENCRYPTION
-        config ESPNOW_PMK
-            string "ESPNOW primary master key"
-            default "pmk1234567890123"
-            help
-                ESPNOW primary master key. The length should be 16 bytes.
-                Only used when encryption is enabled.
-
-        config ESPNOW_LMK
-            string "ESPNOW local master key"
-            default "lmk1234567890123"
-            help
-                ESPNOW local master key. The length should be 16 bytes.
-                Only used when encryption is enabled.
-    endif
+            Set a custom name to identify this PCB/device in logs during ESP-NOW discovery.
+            This name will be used instead of MAC address for easier identification.
 
     config ESPNOW_CHANNEL
         int "Channel"
@@ -104,7 +24,7 @@ menu "Example Configuration"
     config ESPNOW_SEND_LEN
         int "Send len"
         range 10 250
-        default 10
+        default 20
         help
             Length of ESPNOW data to be sent, unit: byte.
 
@@ -138,5 +58,29 @@ menu "Example Configuration"
         depends on ESPNOW_ENABLE_POWER_SAVE
         help
             ESPNOW wake interval
+
+    config ESPNOW_ENABLE_ENCRYPTION
+        bool "Enable Encryption"
+        default "n"
+        help
+            Enable or disable encryption for ESP-NOW communication. When disabled, 
+            communication will be unencrypted for better performance and lower power 
+            consumption, but less secure.
+
+    if ESPNOW_ENABLE_ENCRYPTION
+        config ESPNOW_PMK
+            string "ESPNOW primary master key"
+            default "pmk1234567890123"
+            help
+                ESPNOW primary master key. The length should be 16 bytes.
+                Only used when encryption is enabled.
+
+        config ESPNOW_LMK
+            string "ESPNOW local master key"
+            default "lmk1234567890123"
+            help
+                ESPNOW local master key. The length should be 16 bytes.
+                Only used when encryption is enabled.
+    endif
 
 endmenu
