@@ -474,6 +474,13 @@ CONFIG_ESPNOW_ENABLE_LONG_RANGE=y
 # end of Example Configuration
 
 #
+# ESP-NOW Library Configuration
+#
+CONFIG_ESPNOW_MAX_PEERS=20
+CONFIG_ESPNOW_DISCOVERY_TIMEOUT=30000
+# end of ESP-NOW Library Configuration
+
+#
 # Compiler options
 #
 CONFIG_COMPILER_OPTIMIZATION_DEBUG=y

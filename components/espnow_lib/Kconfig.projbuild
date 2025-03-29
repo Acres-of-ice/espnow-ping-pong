@@ -1,0 +1,68 @@
+menu "ESP-NOW Library Configuration"
+
+    config ESPNOW_PCB_NAME
+        string "Device Identifier Name"
+        default "ESP32-Device"
+        help
+            Set a custom name to identify this device during ESP-NOW discovery.
+            This name will be used instead of MAC address for easier identification.
+
+    config ESPNOW_CHANNEL
+        int "WiFi Channel"
+        default 1
+        range 1 14
+        help
+            The WiFi channel on which ESP-NOW will operate. All devices must use the same channel.
+
+    config ESPNOW_SEND_DELAY
+        int "Send Delay (ms)"
+        default 1000
+        range 0 10000
+        help
+            Delay between sending two ESPNOW data packets, unit: ms.
+
+    config ESPNOW_ENABLE_LONG_RANGE
+        bool "Enable Long Range Mode"
+        default "y"
+        help
+            When enabled, the PHY rate will be reduced to increase range at the expense of bandwidth.
+
+    config ESPNOW_ENABLE_ENCRYPTION
+        bool "Enable Encryption"
+        default "n"
+        help
+            Enable or disable encryption for ESP-NOW communication. When disabled, 
+            communication will be unencrypted for better performance and lower power 
+            consumption, but less secure.
+
+    if ESPNOW_ENABLE_ENCRYPTION
+        config ESPNOW_PMK
+            string "ESPNOW primary master key"
+            default "pmk1234567890123"
+            help
+                ESPNOW primary master key. The length should be 16 bytes.
+                Only used when encryption is enabled.
+
+        config ESPNOW_LMK
+            string "ESPNOW local master key"
+            default "lmk1234567890123"
+            help
+                ESPNOW local master key. The length should be 16 bytes.
+                Only used when encryption is enabled.
+    endif
+
+    config ESPNOW_MAX_PEERS
+        int "Maximum number of peers"
+        default 20
+        range 1 20
+        help
+            Maximum number of ESP-NOW peers that can be stored and managed.
+
+    config ESPNOW_DISCOVERY_TIMEOUT
+        int "Peer Discovery Timeout (ms)"
+        default 30000
+        range 1000 300000
+        help
+            Timeout for peer discovery phase in milliseconds.
+
+endmenu
