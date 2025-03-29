@@ -40,6 +40,13 @@ static uint8_t s_own_mac[ESP_NOW_ETH_ALEN] = {0};
 static int64_t s_last_recv_time = 0;
 static bool s_communication_active = true;
 #define RESPONSE_TIMEOUT_MS 60000 // 1 minute timeout
+#define CONFIG_ESPNOW_MAX_PEERS 20
+#define ESPNOW_DISCOVERY_TIMEOUT_MS 30000 // 30 seconds timeout for discovery
+//// For peer discovery and management
+static bool s_peer_discovery_complete = false;
+static uint8_t s_discovered_peers[CONFIG_ESPNOW_MAX_PEERS][ESP_NOW_ETH_ALEN] = {
+    0};
+static int s_discovered_peer_count = 0;
 
 #define ESPNOW_MAXDELAY 512
 // Fpor power saving
@@ -59,6 +66,27 @@ static void example_espnow_deinit(example_espnow_send_param_t *send_param);
 // Array to hold trusted MAC addresses
 static uint8_t s_trusted_mac_list[5][ESP_NOW_ETH_ALEN] = {0};
 static int s_trusted_mac_count = 0;
+
+/* ESPNOW sending or receiving callback function is called in WiFi task.
+ * Users should not do lengthy operations from this task. Instead, post
+ * necessary data to a queue and handle it from a lower priority task. */
+static void example_espnow_send_cb(const uint8_t *mac_addr,
+                                   esp_now_send_status_t status) {
+  example_espnow_event_t evt;
+  example_espnow_event_send_cb_t *send_cb = &evt.info.send_cb;
+
+  if (mac_addr == NULL) {
+    ESP_LOGE(TAG, "Send cb arg error");
+    return;
+  }
+
+  evt.id = EXAMPLE_ESPNOW_SEND_CB;
+  memcpy(send_cb->mac_addr, mac_addr, ESP_NOW_ETH_ALEN);
+  send_cb->status = status;
+  if (xQueueSend(s_example_espnow_queue, &evt, ESPNOW_MAXDELAY) != pdTRUE) {
+    ESP_LOGW(TAG, "Send send queue fail");
+  }
+}
 
 // Function to initialize own MAC address
 static void init_own_mac(void) {
@@ -326,23 +354,30 @@ static void example_espnow_recv_cb(const esp_now_recv_info_t *recv_info,
   rssi_web_espnow_recv_cb(recv_info, data, len);
 }
 
-/* WiFi should start before using ESPNOW */
+// Modified version of the example_wifi_init function to support APSTA mode
+// correctly
 static void example_wifi_init(void) {
   // Initialize networking stack
   ESP_ERROR_CHECK(esp_netif_init());
   ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+  // Create default AP interface
   esp_netif_create_default_wifi_ap();
 
   // Get MAC address for unique SSID
   uint8_t mac[6];
   ESP_ERROR_CHECK(esp_efuse_mac_get_default(mac));
   char ssid[32];
-  snprintf(ssid, sizeof(ssid), "ESP-NOW-RSSI-%02X", mac[0]);
+  snprintf(ssid, sizeof(ssid), "ESP-NOW-RSSI-%02X%02X", mac[0], mac[1]);
+
+  // Store own MAC address for later use
+  init_own_mac();
 
   // Initialize and configure WiFi
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+  ESP_ERROR_CHECK(
+      esp_wifi_set_mode(WIFI_MODE_APSTA)); // APSTA mode for both AP and ESP-NOW
 
   // Set up AP configuration
   wifi_config_t ap_config = {0};
@@ -357,37 +392,15 @@ static void example_wifi_init(void) {
   ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
   ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
   ESP_ERROR_CHECK(esp_wifi_start());
-  // Add these lines for power saving:
+
+  // Power saving settings
   ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
-  // Set maximum transmission power
-  ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(84));
+  ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(84)); // Maximum transmission power
   ESP_ERROR_CHECK(
       esp_wifi_set_channel(CONFIG_ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
 
-  // Log connection info
   ESP_LOGI(TAG, "WiFi AP started: SSID=%s, Password=12345678, IP=192.168.4.1",
            ssid);
-}
-
-/* ESPNOW sending or receiving callback function is called in WiFi task.
- * Users should not do lengthy operations from this task. Instead, post
- * necessary data to a queue and handle it from a lower priority task. */
-static void example_espnow_send_cb(const uint8_t *mac_addr,
-                                   esp_now_send_status_t status) {
-  example_espnow_event_t evt;
-  example_espnow_event_send_cb_t *send_cb = &evt.info.send_cb;
-
-  if (mac_addr == NULL) {
-    ESP_LOGE(TAG, "Send cb arg error");
-    return;
-  }
-
-  evt.id = EXAMPLE_ESPNOW_SEND_CB;
-  memcpy(send_cb->mac_addr, mac_addr, ESP_NOW_ETH_ALEN);
-  send_cb->status = status;
-  if (xQueueSend(s_example_espnow_queue, &evt, ESPNOW_MAXDELAY) != pdTRUE) {
-    ESP_LOGW(TAG, "Send send queue fail");
-  }
 }
 
 /* Parse received ESPNOW data. */
@@ -441,106 +454,86 @@ static void example_espnow_task(void *pvParameter) {
   uint32_t recv_magic = 0;
   bool is_broadcast = false;
   int ret;
+
   // Initialize the last receive time
   s_last_recv_time = esp_timer_get_time() / 1000; // Convert to milliseconds
+  int64_t discovery_start_time = s_last_recv_time;
 
   // Make sure to properly cast the parameter at the beginning
   example_espnow_send_param_t *send_param =
       (example_espnow_send_param_t *)pvParameter;
 
-  vTaskDelay(5000 / portTICK_PERIOD_MS);
+  // Wait a moment before starting
+  vTaskDelay(3000 / portTICK_PERIOD_MS);
 
-#if CONFIG_ESPNOW_USE_TRUSTED_MACS
-  if (s_trusted_mac_count > 0) {
-    ESP_LOGI(TAG, "Start sending unicast data to trusted peers");
+  ESP_LOGI(TAG, "Starting peer discovery with broadcast...");
 
-    example_espnow_send_param_t *send_param =
-        (example_espnow_send_param_t *)pvParameter;
+  // Initialize in broadcast mode for discovery
+  send_param->unicast = false;
+  send_param->broadcast = true;
+  send_param->state = 0;
+  memcpy(send_param->dest_mac, s_example_broadcast_mac, ESP_NOW_ETH_ALEN);
+  example_espnow_data_prepare(send_param);
 
-    // Send to each trusted peer
-    for (int i = 0; i < s_trusted_mac_count; i++) {
-      // Skip sending to our own MAC address
-      if (is_own_mac(s_trusted_mac_list[i])) {
-        ESP_LOGI(TAG, "Skipping sending to own MAC address: " MACSTR,
-                 MAC2STR(s_trusted_mac_list[i]));
-        continue;
-      }
-      // Set destination MAC
-      memcpy(send_param->dest_mac, s_trusted_mac_list[i], ESP_NOW_ETH_ALEN);
-
-      // Prepare data
-      send_param->unicast = true;
-      send_param->broadcast = false;
-      example_espnow_data_prepare(send_param);
-
-      // Send data
-      ESP_LOGI(TAG, "Sending to trusted peer %d: " MACSTR, i + 1,
-               MAC2STR(s_trusted_mac_list[i]));
-
-      if (esp_now_send(send_param->dest_mac, send_param->buffer,
-                       send_param->len) != ESP_OK) {
-        ESP_LOGE(TAG, "Send error to peer %d", i + 1);
-      }
-
-      // Delay between sends
-      vTaskDelay(500 / portTICK_PERIOD_MS);
-    }
-  } else {
-    ESP_LOGW(TAG, "No trusted peers configured, not sending data");
-    example_espnow_deinit(pvParameter);
-    vTaskDelete(NULL);
-    return;
-  }
-#else
-
-  ESP_LOGI(TAG, "Start sending broadcast data");
-
-  /* Start sending broadcast ESPNOW data. */
-  example_espnow_send_param_t *send_param =
-      (example_espnow_send_param_t *)pvParameter;
+  // Send initial broadcast to discover peers
   if (esp_now_send(send_param->dest_mac, send_param->buffer, send_param->len) !=
       ESP_OK) {
-    ESP_LOGE(TAG, "Send error");
+    ESP_LOGE(TAG, "Initial broadcast send error");
     example_espnow_deinit(send_param);
     vTaskDelete(NULL);
   }
-#endif
 
-  // Main task loop - combined timeout checking with queue processing
+  // Main task loop - handles both discovery and regular communication
   while (s_communication_active) {
-    // Check if we've exceeded the timeout
-    int64_t current_time =
-        esp_timer_get_time() / 1000; // Convert to milliseconds
+    // Get current time and check timeouts
+    int64_t current_time = esp_timer_get_time() / 1000;
     int64_t time_since_last_recv = current_time - s_last_recv_time;
 
-    // If no messages received for the timeout period
+    // Check if we're in discovery mode and should timeout
+    if (!s_peer_discovery_complete &&
+        (current_time - discovery_start_time > ESPNOW_DISCOVERY_TIMEOUT_MS)) {
+
+      ESP_LOGI(TAG, "Peer discovery completed with %d peers found",
+               s_discovered_peer_count);
+      s_peer_discovery_complete = true;
+
+      // If we found any peers, switch to unicast with the first one
+      if (s_discovered_peer_count > 0) {
+        ESP_LOGI(TAG, "Switching to unicast mode with peer: " MACSTR,
+                 MAC2STR(s_discovered_peers[0]));
+
+        send_param->broadcast = false;
+        send_param->unicast = true;
+        memcpy(send_param->dest_mac, s_discovered_peers[0], ESP_NOW_ETH_ALEN);
+        example_espnow_data_prepare(send_param);
+
+        if (esp_now_send(send_param->dest_mac, send_param->buffer,
+                         send_param->len) != ESP_OK) {
+          ESP_LOGE(TAG, "Failed to send first unicast");
+        }
+      } else {
+        ESP_LOGW(TAG, "No peers discovered during broadcast phase");
+      }
+    }
+
+    // Check for communication timeout (applies to both discovery and unicast
+    // phases)
     if (time_since_last_recv > RESPONSE_TIMEOUT_MS) {
       ESP_LOGW(TAG, "No response received for %lld ms, stopping communication",
                time_since_last_recv);
       s_communication_active = false;
-      break; // Exit the loop
+      break;
     }
 
-    // Wait for queue events with a timeout to prevent CPU hogging
-    // Using a short timeout allows us to periodically check the communication
-    // timeout
+    // Process incoming queue messages
     if (xQueueReceive(s_example_espnow_queue, &evt, pdMS_TO_TICKS(1000)) ==
         pdTRUE) {
       switch (evt.id) {
       case EXAMPLE_ESPNOW_SEND_CB: {
         example_espnow_event_send_cb_t *send_cb = &evt.info.send_cb;
-#if CONFIG_ESPNOW_USE_TRUSTED_MACS
-        // Only proceed if this is a trusted MAC
-        if (!is_trusted_mac(send_cb->mac_addr)) {
-          ESP_LOGW(TAG, "Ignoring non-trusted MAC: " MACSTR,
-                   MAC2STR(send_cb->mac_addr));
-          break;
-        }
-#else
         is_broadcast = IS_BROADCAST_ADDR(send_cb->mac_addr);
-#endif
 
-        ESP_LOGD(TAG, "Send data to " MACSTR ", status1: %d",
+        ESP_LOGD(TAG, "Send data to " MACSTR ", status: %d",
                  MAC2STR(send_cb->mac_addr), send_cb->status);
 
         if (is_broadcast && (send_param->broadcast == false)) {
@@ -550,23 +543,31 @@ static void example_espnow_task(void *pvParameter) {
         if (!is_broadcast) {
           send_param->count--;
           if (send_param->count == 0) {
-            ESP_LOGI(TAG, "Send done");
+            ESP_LOGI(TAG, "Send count reached, done");
             example_espnow_deinit(send_param);
             vTaskDelete(NULL);
           }
         }
 
-        /* Delay a while before sending the next data. */
+        // Delay before sending next data
         if (send_param->delay > 0) {
           vTaskDelay(send_param->delay / portTICK_PERIOD_MS);
         }
 
-        ESP_LOGI(TAG, "send data to " MACSTR "", MAC2STR(send_cb->mac_addr));
+        // For discovery mode, keep broadcasting
+        // For unicast mode, keep sending to the same peer
+        if (!s_peer_discovery_complete) {
+          // In discovery mode - keep broadcasting
+          memcpy(send_param->dest_mac, s_example_broadcast_mac,
+                 ESP_NOW_ETH_ALEN);
+        } else {
+          // In unicast mode - reuse existing destination
+          // dest_mac is already set correctly
+        }
 
-        memcpy(send_param->dest_mac, send_cb->mac_addr, ESP_NOW_ETH_ALEN);
         example_espnow_data_prepare(send_param);
 
-        /* Send the next data after the previous data is sent. */
+        // Send the next packet
         if (esp_now_send(send_param->dest_mac, send_param->buffer,
                          send_param->len) != ESP_OK) {
           ESP_LOGE(TAG, "Send error");
@@ -580,98 +581,90 @@ static void example_espnow_task(void *pvParameter) {
 
         ret = example_espnow_data_parse(recv_cb->data, recv_cb->data_len,
                                         &recv_state, &recv_seq, &recv_magic);
-        free(recv_cb->data);
-        if (ret == EXAMPLE_ESPNOW_DATA_BROADCAST) {
-          ESP_LOGI(TAG, "Receive %dth broadcast data from: " MACSTR ", len: %d",
-                   recv_seq, MAC2STR(recv_cb->mac_addr), recv_cb->data_len);
-#if CONFIG_ESPNOW_USE_TRUSTED_MACS
-          // Only process packets from trusted sources
-          if (!is_trusted_mac(recv_cb->mac_addr)) {
-            ESP_LOGW(TAG, "Received data from untrusted source: " MACSTR,
-                     MAC2STR(recv_cb->mac_addr));
-            break;
-          }
-#endif
 
-          /* If MAC address does not exist in peer list, add it to peer list. */
-          if (esp_now_is_peer_exist(recv_cb->mac_addr) == false) {
-            esp_now_peer_info_t *peer = malloc(sizeof(esp_now_peer_info_t));
-            if (peer == NULL) {
-              ESP_LOGE(TAG, "Malloc peer information fail");
-              example_espnow_deinit(send_param);
-              vTaskDelete(NULL);
+        // Process valid data
+        if (ret == EXAMPLE_ESPNOW_DATA_BROADCAST ||
+            ret == EXAMPLE_ESPNOW_DATA_UNICAST) {
+
+          // For discovery mode - track unique peers
+          if (!s_peer_discovery_complete) {
+            bool peer_exists = false;
+
+            // Check if we already know this peer
+            for (int i = 0; i < s_discovered_peer_count; i++) {
+              if (memcmp(s_discovered_peers[i], recv_cb->mac_addr,
+                         ESP_NOW_ETH_ALEN) == 0) {
+                peer_exists = true;
+                break;
+              }
             }
-            memset(peer, 0, sizeof(esp_now_peer_info_t));
-            peer->channel = CONFIG_ESPNOW_CHANNEL;
-            peer->ifidx = ESPNOW_WIFI_IF;
-#if CONFIG_ESPNOW_ENABLE_ENCRYPTION
-            peer->encrypt = true;
-            memcpy(peer->lmk, CONFIG_ESPNOW_LMK, ESP_NOW_KEY_LEN);
-            ESP_LOGI(TAG, "Adding peer with encryption enabled");
-#else
-            peer->encrypt = false;
-            ESP_LOGI(TAG, "Adding peer with encryption disabled");
-#endif
-            memcpy(peer->peer_addr, recv_cb->mac_addr, ESP_NOW_ETH_ALEN);
-            ESP_ERROR_CHECK(esp_now_add_peer(peer));
-            free(peer);
-          }
 
-          /* Indicates that the device has received broadcast ESPNOW data. */
-          if (send_param->state == 0) {
-            send_param->state = 1;
-          }
+            // If this is a new peer, add it to our list
+            if (!peer_exists &&
+                s_discovered_peer_count < CONFIG_ESPNOW_MAX_PEERS) {
+              // Don't add our own MAC address as a peer
+              if (!is_own_mac(recv_cb->mac_addr)) {
+                ESP_LOGI(TAG, "New peer discovered: " MACSTR,
+                         MAC2STR(recv_cb->mac_addr));
 
-          /* If receive broadcast ESPNOW data which indicates that the other
-           * device has received broadcast ESPNOW data and the local magic
-           * number is bigger than that in the received broadcast ESPNOW data,
-           * stop sending broadcast ESPNOW data and start sending unicast ESPNOW
-           * data.
-           */
-          if (recv_state == 1) {
-            /* The device which has the bigger magic number sends ESPNOW data,
-             * the other one receives ESPNOW data.
-             */
-            if (send_param->unicast == false &&
-                send_param->magic >= recv_magic) {
-              ESP_LOGI(TAG, "Start sending unicast data");
-              ESP_LOGI(TAG, "send data to " MACSTR "",
-                       MAC2STR(recv_cb->mac_addr));
+                memcpy(s_discovered_peers[s_discovered_peer_count],
+                       recv_cb->mac_addr, ESP_NOW_ETH_ALEN);
+                s_discovered_peer_count++;
 
-              /* Start sending unicast ESPNOW data. */
-              memcpy(send_param->dest_mac, recv_cb->mac_addr, ESP_NOW_ETH_ALEN);
-              example_espnow_data_prepare(send_param);
-              if (esp_now_send(send_param->dest_mac, send_param->buffer,
-                               send_param->len) != ESP_OK) {
-                ESP_LOGE(TAG, "Send error");
-                example_espnow_deinit(send_param);
-                vTaskDelete(NULL);
-              } else {
-                send_param->broadcast = false;
-                send_param->unicast = true;
+                // Add this peer to ESP-NOW peer list
+                if (esp_now_is_peer_exist(recv_cb->mac_addr) == false) {
+                  esp_now_peer_info_t *peer =
+                      malloc(sizeof(esp_now_peer_info_t));
+                  if (peer == NULL) {
+                    ESP_LOGE(TAG, "Malloc peer information fail");
+                    free(recv_cb->data);
+                    break;
+                  }
+
+                  memset(peer, 0, sizeof(esp_now_peer_info_t));
+                  peer->channel = CONFIG_ESPNOW_CHANNEL;
+                  peer->ifidx = ESPNOW_WIFI_IF;
+                  peer->encrypt = false;
+                  memcpy(peer->peer_addr, recv_cb->mac_addr, ESP_NOW_ETH_ALEN);
+                  ESP_ERROR_CHECK(esp_now_add_peer(peer));
+                  free(peer);
+                }
               }
             }
           }
-        } else if (ret == EXAMPLE_ESPNOW_DATA_UNICAST) {
-          ESP_LOGI(TAG, "Receive %dth unicast data from: " MACSTR ", len: %d",
-                   recv_seq, MAC2STR(recv_cb->mac_addr), recv_cb->data_len);
 
-          /* If receive unicast ESPNOW data, also stop sending broadcast ESPNOW
-           * data. */
-          send_param->broadcast = false;
-        } else {
-          ESP_LOGI(TAG, "Receive error data from: " MACSTR "",
-                   MAC2STR(recv_cb->mac_addr));
+          // Handle transition from broadcast to unicast
+          if (ret == EXAMPLE_ESPNOW_DATA_BROADCAST && recv_state == 1) {
+            // If we receive a broadcast with state=1, it means the other device
+            // has received our broadcast. Choose who continues sending based on
+            // magic.
+            if (send_param->unicast == false &&
+                send_param->magic >= recv_magic) {
+              ESP_LOGI(TAG, "Starting unicast communication with " MACSTR,
+                       MAC2STR(recv_cb->mac_addr));
+
+              send_param->broadcast = false;
+              send_param->unicast = true;
+              memcpy(send_param->dest_mac, recv_cb->mac_addr, ESP_NOW_ETH_ALEN);
+              example_espnow_data_prepare(send_param);
+
+              if (esp_now_send(send_param->dest_mac, send_param->buffer,
+                               send_param->len) != ESP_OK) {
+                ESP_LOGE(TAG, "Send error");
+              }
+            }
+          }
         }
+
+        free(recv_cb->data);
         break;
       }
       default:
         ESP_LOGE(TAG, "Callback type error: %d", evt.id);
         break;
       }
-    }
-    // If we didn't get a queue item, yield to other tasks
-    else {
+    } else {
+      // No queue message received, yield to other tasks
       vTaskDelay(pdMS_TO_TICKS(10));
     }
   }
@@ -688,58 +681,31 @@ static esp_err_t example_espnow_init(void) {
   s_example_espnow_queue =
       xQueueCreate(ESPNOW_QUEUE_SIZE, sizeof(example_espnow_event_t));
   if (s_example_espnow_queue == NULL) {
-    ESP_LOGE(TAG, "Create mutex fail");
+    ESP_LOGE(TAG, "Create queue fail");
     return ESP_FAIL;
   }
 
-  /* Initialize ESPNOW and register sending and receiving callback function.
-   */
+  // Initialize ESPNOW and register callbacks
   ESP_ERROR_CHECK(esp_now_init());
   ESP_ERROR_CHECK(esp_now_register_send_cb(example_espnow_send_cb));
   ESP_ERROR_CHECK(esp_now_register_recv_cb(example_espnow_recv_cb));
+
+  // Power saving settings
 #if CONFIG_ESPNOW_ENABLE_POWER_SAVE
   ESP_ERROR_CHECK(esp_now_set_wake_window(CONFIG_ESPNOW_WAKE_WINDOW));
   ESP_ERROR_CHECK(esp_wifi_connectionless_module_set_wake_interval(
       CONFIG_ESPNOW_WAKE_INTERVAL));
 #endif
 
-#if CONFIG_ESPNOW_ENABLE_ENCRYPTION
-  /* Set primary master key only if encryption is enabled */
-  ESP_ERROR_CHECK(esp_now_set_pmk((uint8_t *)CONFIG_ESPNOW_PMK));
-#endif
-
-  // Load trusted MAC addresses from Kconfig
-  load_trusted_mac_addresses();
-#if CONFIG_ESPNOW_USE_TRUSTED_MACS
-  // Add each trusted peer
-  for (int i = 0; i < s_trusted_mac_count; i++) {
-    esp_now_peer_info_t *peer = malloc(sizeof(esp_now_peer_info_t));
-    if (peer == NULL) {
-      ESP_LOGE(TAG, "Malloc peer information fail");
-      vSemaphoreDelete(s_example_espnow_queue);
-      esp_now_deinit();
-      return ESP_FAIL;
-    }
-
-    memset(peer, 0, sizeof(esp_now_peer_info_t));
-    peer->channel = CONFIG_ESPNOW_CHANNEL;
-    peer->ifidx = ESPNOW_WIFI_IF;
-    peer->encrypt = false;
-    ESP_LOGI(TAG, "Adding trusted peer %d with encryption disabled", i + 1);
-    memcpy(peer->peer_addr, s_trusted_mac_list[i], ESP_NOW_ETH_ALEN);
-    ESP_ERROR_CHECK(esp_now_add_peer(peer));
-    free(peer);
-  }
-#else
-
-  /* Add broadcast peer information to peer list. */
+  // Add broadcast peer
   esp_now_peer_info_t *peer = malloc(sizeof(esp_now_peer_info_t));
   if (peer == NULL) {
     ESP_LOGE(TAG, "Malloc peer information fail");
-    vSemaphoreDelete(s_example_espnow_queue);
+    vQueueDelete(s_example_espnow_queue);
     esp_now_deinit();
     return ESP_FAIL;
   }
+
   memset(peer, 0, sizeof(esp_now_peer_info_t));
   peer->channel = CONFIG_ESPNOW_CHANNEL;
   peer->ifidx = ESPNOW_WIFI_IF;
@@ -747,36 +713,38 @@ static esp_err_t example_espnow_init(void) {
   memcpy(peer->peer_addr, s_example_broadcast_mac, ESP_NOW_ETH_ALEN);
   ESP_ERROR_CHECK(esp_now_add_peer(peer));
   free(peer);
-#endif
 
-  /* Initialize sending parameters. */
+  // Initialize sending parameters for discovery
   send_param = malloc(sizeof(example_espnow_send_param_t));
   if (send_param == NULL) {
     ESP_LOGE(TAG, "Malloc send parameter fail");
-    vSemaphoreDelete(s_example_espnow_queue);
+    vQueueDelete(s_example_espnow_queue);
     esp_now_deinit();
     return ESP_FAIL;
   }
+
   memset(send_param, 0, sizeof(example_espnow_send_param_t));
   send_param->unicast = false;
   send_param->broadcast = true;
   send_param->state = 0;
   send_param->magic = esp_random();
-  // send_param->count = CONFIG_ESPNOW_SEND_COUNT;
-  send_param->count = UINT32_MAX;
+  send_param->count = UINT32_MAX; // Run indefinitely
   send_param->delay = CONFIG_ESPNOW_SEND_DELAY;
   send_param->len = CONFIG_ESPNOW_SEND_LEN;
   send_param->buffer = malloc(CONFIG_ESPNOW_SEND_LEN);
+
   if (send_param->buffer == NULL) {
     ESP_LOGE(TAG, "Malloc send buffer fail");
     free(send_param);
-    vSemaphoreDelete(s_example_espnow_queue);
+    vQueueDelete(s_example_espnow_queue);
     esp_now_deinit();
     return ESP_FAIL;
   }
+
   memcpy(send_param->dest_mac, s_example_broadcast_mac, ESP_NOW_ETH_ALEN);
   example_espnow_data_prepare(send_param);
 
+  // Create task for ESP-NOW communication
   xTaskCreate(example_espnow_task, "example_espnow_task", 2048, send_param, 4,
               NULL);
 
