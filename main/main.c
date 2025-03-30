@@ -141,7 +141,11 @@ void app_main(void) {
       .enable_long_range = true,   // Enable long range mode
       .enable_encryption = false,  // No encryption for simplicity
       .recv_cb = on_data_received, // Callback for received data
-      .send_cb = on_data_sent      // Callback for sent data
+      .send_cb = on_data_sent,     // Callback for sent data
+
+      // Authentication settings
+      .require_auth = true, // Enable authentication
+      .auth_key = "AIR4201" // Set authentication key
   };
 
   // Initialize ESP-NOW
@@ -153,7 +157,7 @@ void app_main(void) {
   ESP_LOGI(TAG, "ESP-NOW initialized with PCB name: %s", pcb_name);
 
   // Create a task for sending messages
-  xTaskCreate(send_task, "send_task", 2048, NULL, 5, NULL);
+  xTaskCreate(send_task, "send_task", 4096, NULL, 5, NULL);
 
   // Main loop to process received messages
   while (1) {

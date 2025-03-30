@@ -91,8 +91,7 @@ typedef struct {
 
 /** Configuration structure for the ESP-NOW library */
 typedef struct {
-  const char *pcb_name;     // PCB name for this device (max
-                            // ESPNOW_MAX_PCB_NAME_LENGTH chars)
+  const char *pcb_name;     // PCB name for this device
   uint8_t wifi_channel;     // WiFi channel to use (usually 1-13)
   uint16_t send_delay_ms;   // Delay between sending packets (ms)
   bool enable_long_range;   // Enable long range mode
@@ -101,6 +100,10 @@ typedef struct {
   const char *lmk;          // Local Master Key (if encryption enabled)
   espnow_recv_cb_t recv_cb; // User callback for received data
   espnow_send_cb_t send_cb; // User callback for send status
+
+  // New authentication fields
+  bool require_auth;    // Whether to require authentication
+  const char *auth_key; // Authentication key (NULL to disable)
 } espnow_config_t;
 
 /**
@@ -194,6 +197,13 @@ esp_err_t espnow_add_trusted_peer(const uint8_t *mac_addr);
  * @return bool true if trusted, false otherwise
  */
 bool espnow_is_trusted_peer(const uint8_t *mac_addr);
+
+// Add this to your espnow_data_type_t enum (if using enum) or define separately
+#define ESPNOW_DATA_AUTH 3 // Authentication message type
+
+// Authentication functions
+esp_err_t espnow_authenticate_peer(const uint8_t *mac_addr);
+bool espnow_is_authenticated(const uint8_t *mac_addr);
 
 #ifdef __cplusplus
 }
