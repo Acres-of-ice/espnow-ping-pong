@@ -199,7 +199,7 @@ esp_err_t espnow_add_trusted_peer(const uint8_t *mac_addr);
 bool espnow_is_trusted_peer(const uint8_t *mac_addr);
 
 // Add this to your espnow_data_type_t enum (if using enum) or define separately
-#define ESPNOW_DATA_AUTH 3 // Authentication message type
+#define ESPNOW_AUTH 4 // Broadcast authentication message type
 
 // Authentication functions
 esp_err_t espnow_authenticate_peer(const uint8_t *mac_addr);
