@@ -6,14 +6,14 @@
 #include "espnow_lib.h"
 #include "esp_crc.h"
 #include "esp_log.h"
-#include "esp_mac.h" // Add this include for MACSTR and MAC2STR macros
+#include "esp_mac.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include <inttypes.h> // Add this at the top of your file
+#include <inttypes.h>
 #include <string.h>
 
 static const char *TAG = "espnow_lib";
@@ -38,11 +38,9 @@ static char s_auth_key[16] = {0};   // Authentication key
 static bool s_require_auth = false; // Whether authentication is required
 static uint8_t s_auth_peers[ESPNOW_MAX_PEERS][ESP_NOW_ETH_ALEN] = {0};
 static int s_auth_peer_count = 0;
-
-/* 5. Add periodic authentication broadcasts in the espnow_task */
-// In the espnow_task function, add this in the main loop:
-static uint32_t s_last_auth_broadcast = 0;
-static const uint32_t AUTH_BROADCAST_INTERVAL_MS = 5000; // Every 5 seconds
+static uint32_t s_auth_broadcast_interval_ms = 5000; // Default 5s interval
+static uint8_t s_max_auth_attempts = 3;   // Default max auth attempts
+static int64_t s_last_auth_broadcast = 0; // Last auth broadcast timestamp
 
 /* Peer information structure */
 typedef struct {
@@ -64,22 +62,6 @@ static int s_auth_initiator_count = 0;
 static espnow_recv_cb_t s_user_recv_cb = NULL;
 static espnow_send_cb_t s_user_send_cb = NULL;
 
-static void espnow_send_cb(const uint8_t *mac_addr,
-                           esp_now_send_status_t status);
-static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
-                           const uint8_t *data, int len);
-static void init_own_mac(void);
-static bool is_own_mac(const uint8_t *mac_addr);
-static void store_peer_pcb_name(const uint8_t *mac_addr, const char *pcb_name);
-static esp_err_t espnow_send_internal(const uint8_t *mac_addr, const void *data,
-                                      size_t len, bool include_pcb_name);
-static int parse_espnow_data(uint8_t *data, uint16_t data_len, uint8_t *state,
-                             uint16_t *seq, uint32_t *magic, char *pcb_name);
-static void add_authenticated_peer(const uint8_t *mac_addr);
-bool espnow_is_authenticated(const uint8_t *mac_addr);
-bool espnow_is_peer_initiator(const uint8_t *mac_addr);
-esp_err_t espnow_broadcast_auth(void);
-
 /* ESP-NOW event structure */
 typedef struct {
   espnow_event_id_t id;
@@ -90,6 +72,23 @@ typedef struct {
 } espnow_event_t;
 
 /* Forward declarations of static functions */
+static void espnow_send_cb(const uint8_t *mac_addr,
+                           esp_now_send_status_t status);
+static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
+                           const uint8_t *data, int len);
+static void espnow_task(void *pvParameter);
+static void init_own_mac(void);
+static bool is_own_mac(const uint8_t *mac_addr);
+static void store_peer_pcb_name(const uint8_t *mac_addr, const char *pcb_name);
+static esp_err_t espnow_send_internal(const uint8_t *mac_addr, const void *data,
+                                      size_t len, bool include_pcb_name);
+static int parse_espnow_data(uint8_t *data, uint16_t data_len, uint8_t *state,
+                             uint16_t *seq, uint32_t *magic, char *pcb_name);
+static void add_authenticated_peer(const uint8_t *mac_addr);
+
+/**
+ * @brief Main ESP-NOW task for handling events and periodic operations
+ */
 static void espnow_task(void *pvParameter) {
   int64_t discovery_start_time = esp_timer_get_time() / 1000;
   uint8_t recv_state = 0;
@@ -110,10 +109,10 @@ static void espnow_task(void *pvParameter) {
     // Get current time
     int64_t current_time = esp_timer_get_time() / 1000;
 
-    // Periodically send authentication broadcasts if required
-    if (s_require_auth &&
-        (current_time - s_last_auth_broadcast > AUTH_BROADCAST_INTERVAL_MS)) {
-
+    // Periodically send authentication broadcasts if required and interval is
+    // set
+    if (s_require_auth && s_auth_broadcast_interval_ms > 0 &&
+        (current_time - s_last_auth_broadcast > s_auth_broadcast_interval_ms)) {
       ESP_LOGI(TAG, "SIMPLE-AUTH: Sending periodic auth broadcast");
       espnow_broadcast_auth();
       s_last_auth_broadcast = current_time;
@@ -122,11 +121,9 @@ static void espnow_task(void *pvParameter) {
     // Check discovery timeout
     if (!s_discovery_complete &&
         (current_time - discovery_start_time > s_discovery_timeout_ms)) {
-
       ESP_LOGI(TAG, "Peer discovery completed with %d peers found",
                s_discovered_peer_count);
       s_discovery_complete = true;
-
       // Notify any listeners (could add a callback here)
     }
 
@@ -167,7 +164,7 @@ static void espnow_task(void *pvParameter) {
 
   ESP_LOGI(TAG, "ESP-NOW task ended");
   vTaskDelete(NULL);
-};
+}
 
 esp_err_t espnow_init(const espnow_config_t *config) {
   if (config == NULL) {
@@ -189,6 +186,17 @@ esp_err_t espnow_init(const espnow_config_t *config) {
   // Save user callbacks
   s_user_recv_cb = config->recv_cb;
   s_user_send_cb = config->send_cb;
+
+  // Set up configurable parameters
+  s_discovery_timeout_ms = config->discovery_timeout_ms > 0
+                               ? config->discovery_timeout_ms
+                               : 30000; // Default 30s
+
+  s_auth_broadcast_interval_ms = config->auth_broadcast_interval_ms;
+
+  s_max_auth_attempts = config->max_auth_attempts > 0
+                            ? config->max_auth_attempts
+                            : 3; // Default 3 attempts
 
   // Create queue for ESP-NOW events
   s_espnow_queue = xQueueCreate(10, sizeof(espnow_event_t));
@@ -254,6 +262,7 @@ esp_err_t espnow_init(const espnow_config_t *config) {
   s_last_recv_time = esp_timer_get_time() / 1000; // Convert to milliseconds
   s_communication_active = true;
   s_discovery_complete = false;
+  s_last_auth_broadcast = 0;
 
   // Create ESP-NOW task
   xTaskCreate(espnow_task, "espnow_task", 2048, NULL, 4, &s_espnow_task_handle);
@@ -360,7 +369,7 @@ esp_err_t espnow_start_discovery(uint32_t timeout_ms) {
   memset(s_discovered_peers, 0, sizeof(s_discovered_peers));
   memset(s_peer_info, 0, sizeof(s_peer_info));
 
-  s_discovery_timeout_ms = timeout_ms;
+  s_discovery_timeout_ms = timeout_ms > 0 ? timeout_ms : s_discovery_timeout_ms;
 
   // If authentication is required, send auth broadcast
   if (s_require_auth) {
@@ -371,6 +380,36 @@ esp_err_t espnow_start_discovery(uint32_t timeout_ms) {
     uint8_t dummy_data = 0;
     return espnow_send(ESPNOW_BROADCAST_MAC, &dummy_data, 1);
   }
+}
+
+esp_err_t espnow_add_trusted_peer(const uint8_t *mac_addr) {
+  if (mac_addr == NULL || s_trusted_peer_count >= ESPNOW_MAX_PEERS) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  // Check if already in list
+  for (int i = 0; i < s_trusted_peer_count; i++) {
+    if (memcmp(s_trusted_peers[i], mac_addr, ESP_NOW_ETH_ALEN) == 0) {
+      return ESP_OK; // Already in list
+    }
+  }
+
+  // Add to list
+  memcpy(s_trusted_peers[s_trusted_peer_count], mac_addr, ESP_NOW_ETH_ALEN);
+  s_trusted_peer_count++;
+
+  // Also add as a peer to ESP-NOW
+  if (esp_now_is_peer_exist(mac_addr) == false) {
+    esp_now_peer_info_t peer = {
+        .channel = 0, // Use current channel
+        .ifidx = WIFI_IF_AP,
+        .encrypt = false,
+    };
+    memcpy(peer.peer_addr, mac_addr, ESP_NOW_ETH_ALEN);
+    esp_now_add_peer(&peer);
+  }
+
+  return ESP_OK;
 }
 
 bool espnow_is_trusted_peer(const uint8_t *mac_addr) {
@@ -502,6 +541,81 @@ static esp_err_t espnow_send_internal(const uint8_t *mac_addr, const void *data,
   }
 }
 
+static int parse_espnow_data(uint8_t *data, uint16_t data_len, uint8_t *state,
+                             uint16_t *seq, uint32_t *magic, char *pcb_name) {
+  espnow_data_t *buf = (espnow_data_t *)data;
+  uint16_t crc, crc_cal = 0;
+
+  if (data_len < sizeof(espnow_data_t)) {
+    ESP_LOGE(TAG, "Receive ESPNOW data too short, len:%d", data_len);
+    return -1;
+  }
+
+  *state = buf->state;
+  *seq = buf->seq_num;
+  *magic = buf->magic;
+
+  if (pcb_name != NULL) {
+    strncpy(pcb_name, buf->pcb_name, ESPNOW_MAX_PCB_NAME_LENGTH - 1);
+    pcb_name[ESPNOW_MAX_PCB_NAME_LENGTH - 1] = '\0';
+  }
+
+  crc = buf->crc;
+  buf->crc = 0;
+  crc_cal = esp_crc16_le(UINT16_MAX, (uint8_t const *)buf, data_len);
+
+  if (crc_cal == crc) {
+    return buf->type;
+  }
+
+  return -1;
+}
+
+static void add_authenticated_peer(const uint8_t *mac_addr) {
+  // Check if already authenticated
+  if (espnow_is_authenticated(mac_addr)) {
+    ESP_LOGI(TAG, "AUTH: Peer " MACSTR " was already authenticated",
+             MAC2STR(mac_addr));
+    return;
+  }
+
+  // Add to authenticated list if space available
+  if (s_auth_peer_count < ESPNOW_MAX_PEERS) {
+    memcpy(s_auth_peers[s_auth_peer_count], mac_addr, ESP_NOW_ETH_ALEN);
+    s_auth_peer_count++;
+    ESP_LOGI(TAG, "AUTH: Peer successfully authenticated: " MACSTR,
+             MAC2STR(mac_addr));
+
+    // Log authentication state
+    ESP_LOGI(TAG, "AUTH: Total authenticated peers: %d", s_auth_peer_count);
+  } else {
+    ESP_LOGW(TAG, "AUTH: No space for new authenticated peer");
+  }
+}
+
+static void espnow_send_cb(const uint8_t *mac_addr,
+                           esp_now_send_status_t status) {
+  if (mac_addr == NULL) {
+    ESP_LOGE(TAG, "Send cb arg error");
+    return;
+  }
+
+  // Call user callback if registered
+  if (s_user_send_cb != NULL) {
+    s_user_send_cb(mac_addr, status);
+  }
+
+  // Post event to queue
+  espnow_event_t evt;
+  evt.id = ESPNOW_SEND_CB;
+  memcpy(evt.info.send_cb.mac_addr, mac_addr, ESP_NOW_ETH_ALEN);
+  evt.info.send_cb.status = status;
+
+  if (xQueueSend(s_espnow_queue, &evt, 10 / portTICK_PERIOD_MS) != pdTRUE) {
+    ESP_LOGW(TAG, "Send queue full");
+  }
+}
+
 static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
                            const uint8_t *data, int len) {
   if (recv_info == NULL || data == NULL || len <= 0) {
@@ -526,6 +640,7 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
     return;
   }
 
+  // Process authentication messages
   if (len > 1 && data[0] == ESPNOW_AUTH) {
     // Extract authentication key from message
     char recv_key[16] = {0};
@@ -582,13 +697,60 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
     return;
   }
 
+  // Process ESP-NOW data authentication messages
+  if (len >= 2 && data[0] == ESPNOW_DATA_AUTH) {
+    // Process authentication message
+    uint8_t key_len = data[1];
+
+    ESP_LOGI(TAG,
+             "Received auth message from " MACSTR
+             ", key_len=%d, message_len=%d",
+             MAC2STR(mac_addr), key_len, len);
+
+    // Verify key length is within bounds
+    if (key_len > 0 && 2 + key_len <= len) {
+      // Extract and verify key
+      char recv_key[16] = {0};
+      size_t copy_len =
+          (key_len > sizeof(recv_key) - 1) ? sizeof(recv_key) - 1 : key_len;
+
+      memcpy(recv_key, data + 2, copy_len);
+
+      ESP_LOGI(TAG, "Received auth key: '%s', Comparing with local key: '%s'",
+               recv_key, s_auth_key);
+
+      // If key matches, authenticate the peer
+      if (strcmp(recv_key, s_auth_key) == 0) {
+        ESP_LOGI(TAG, "Authentication successful for " MACSTR,
+                 MAC2STR(mac_addr));
+        add_authenticated_peer(mac_addr);
+
+        // If we're in discovery mode, automatically authenticate back
+        if (!s_discovery_complete) {
+          ESP_LOGI(TAG, "Sending auth confirmation back to " MACSTR,
+                   MAC2STR(mac_addr));
+          espnow_authenticate_peer(mac_addr);
+        }
+      } else {
+        ESP_LOGW(TAG, "Authentication failed for " MACSTR ": key mismatch",
+                 MAC2STR(mac_addr));
+      }
+    } else {
+      ESP_LOGW(TAG, "Auth message has invalid key length: %d (msg len: %d)",
+               key_len, len);
+    }
+
+    // Don't process auth messages further
+    return;
+  }
+
   // Only process messages from authenticated peers (or broadcasts)
   if (!espnow_is_authenticated(mac_addr) &&
       memcmp(mac_addr, ESPNOW_BROADCAST_MAC, ESP_NOW_ETH_ALEN) != 0) {
     ESP_LOGI(TAG, "AUTH: Ignored message from non-authenticated peer: " MACSTR,
              MAC2STR(mac_addr));
 
-    // Always try to authenticate with unknown peers, not just for broadcast
+    // Try to authenticate with unknown peers
     ESP_LOGI(TAG, "AUTH: Attempting to authenticate with unknown peer: " MACSTR,
              MAC2STR(mac_addr));
     espnow_authenticate_peer(mac_addr);
@@ -674,59 +836,6 @@ static void espnow_recv_cb(const esp_now_recv_info_t *recv_info,
   }
 }
 
-static int parse_espnow_data(uint8_t *data, uint16_t data_len, uint8_t *state,
-                             uint16_t *seq, uint32_t *magic, char *pcb_name) {
-  espnow_data_t *buf = (espnow_data_t *)data;
-  uint16_t crc, crc_cal = 0;
-
-  if (data_len < sizeof(espnow_data_t)) {
-    ESP_LOGE(TAG, "Receive ESPNOW data too short, len:%d", data_len);
-    return -1;
-  }
-
-  *state = buf->state;
-  *seq = buf->seq_num;
-  *magic = buf->magic;
-
-  if (pcb_name != NULL) {
-    strncpy(pcb_name, buf->pcb_name, ESPNOW_MAX_PCB_NAME_LENGTH - 1);
-    pcb_name[ESPNOW_MAX_PCB_NAME_LENGTH - 1] = '\0';
-  }
-
-  crc = buf->crc;
-  buf->crc = 0;
-  crc_cal = esp_crc16_le(UINT16_MAX, (uint8_t const *)buf, data_len);
-
-  if (crc_cal == crc) {
-    return buf->type;
-  }
-
-  return -1;
-}
-
-static void espnow_send_cb(const uint8_t *mac_addr,
-                           esp_now_send_status_t status) {
-  if (mac_addr == NULL) {
-    ESP_LOGE(TAG, "Send cb arg error");
-    return;
-  }
-
-  // Call user callback if registered
-  if (s_user_send_cb != NULL) {
-    s_user_send_cb(mac_addr, status);
-  }
-
-  // Post event to queue
-  espnow_event_t evt;
-  evt.id = ESPNOW_SEND_CB;
-  memcpy(evt.info.send_cb.mac_addr, mac_addr, ESP_NOW_ETH_ALEN);
-  evt.info.send_cb.status = status;
-
-  if (xQueueSend(s_espnow_queue, &evt, 10 / portTICK_PERIOD_MS) != pdTRUE) {
-    ESP_LOGW(TAG, "Send queue full");
-  }
-}
-
 bool espnow_is_authenticated(const uint8_t *mac_addr) {
   if (mac_addr == NULL) {
     return false;
@@ -758,30 +867,52 @@ bool espnow_is_authenticated(const uint8_t *mac_addr) {
   return false;
 }
 
-// Add peer to authenticated list
-static void add_authenticated_peer(const uint8_t *mac_addr) {
-  // Check if already authenticated
-  if (espnow_is_authenticated(mac_addr)) {
-    ESP_LOGI(TAG, "AUTH: Peer " MACSTR " was already authenticated",
-             MAC2STR(mac_addr));
-    return;
+bool espnow_is_peer_initiator(const uint8_t *mac_addr) {
+  if (mac_addr == NULL) {
+    return false;
   }
 
-  // Add to authenticated list if space available
-  if (s_auth_peer_count < ESPNOW_MAX_PEERS) {
-    memcpy(s_auth_peers[s_auth_peer_count], mac_addr, ESP_NOW_ETH_ALEN);
-    s_auth_peer_count++;
-    ESP_LOGI(TAG, "AUTH: Peer successfully authenticated: " MACSTR,
-             MAC2STR(mac_addr));
-
-    // Log authentication state
-    ESP_LOGI(TAG, "AUTH: Total authenticated peers: %d", s_auth_peer_count);
-  } else {
-    ESP_LOGW(TAG, "AUTH: No space for new authenticated peer");
+  for (int i = 0; i < s_auth_initiator_count; i++) {
+    if (memcmp(s_auth_initiators[i], mac_addr, ESP_NOW_ETH_ALEN) == 0) {
+      return true;
+    }
   }
+  return false;
 }
 
-// Send authentication message to a peer
+esp_err_t espnow_broadcast_auth(void) {
+  // Create authentication broadcast message (simple structure)
+  // Format: type (1 byte) + auth key (remaining bytes)
+  size_t key_len = strlen(s_auth_key);
+  size_t msg_len = 1 + key_len; // 1 byte type + key
+
+  uint8_t *msg = malloc(msg_len);
+  if (msg == NULL) {
+    ESP_LOGE(TAG, "SIMPLE-AUTH: Failed to allocate memory for auth message");
+    return ESP_ERR_NO_MEM;
+  }
+
+  // Fill message
+  msg[0] = ESPNOW_AUTH;
+  memcpy(msg + 1, s_auth_key, key_len);
+
+  ESP_LOGI(TAG, "SIMPLE-AUTH: Broadcasting auth message with key '%s'",
+           s_auth_key);
+
+  // Send as broadcast
+  esp_err_t ret = esp_now_send(ESPNOW_BROADCAST_MAC, msg, msg_len);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "SIMPLE-AUTH: Failed to send broadcast auth: %s",
+             esp_err_to_name(ret));
+  } else {
+    ESP_LOGI(TAG, "SIMPLE-AUTH: Broadcast auth sent successfully");
+    s_last_auth_broadcast = esp_timer_get_time() / 1000;
+  }
+
+  free(msg);
+  return ret;
+}
+
 esp_err_t espnow_authenticate_peer(const uint8_t *mac_addr) {
   static uint8_t auth_attempts[ESPNOW_MAX_PEERS][ESP_NOW_ETH_ALEN] = {0};
   static uint8_t attempt_count[ESPNOW_MAX_PEERS] = {0};
@@ -853,7 +984,7 @@ esp_err_t espnow_authenticate_peer(const uint8_t *mac_addr) {
     memcpy(auth_attempts[idx], mac_addr, ESP_NOW_ETH_ALEN);
 
     // Limit retries
-    if (attempt_count[idx] >= 3) {
+    if (attempt_count[idx] >= s_max_auth_attempts) {
       ESP_LOGW(TAG, "Max auth attempts reached for " MACSTR " (attempt #%d)",
                MAC2STR(mac_addr), attempt_count[idx]);
       // Reset for future attempts
@@ -873,13 +1004,12 @@ esp_err_t espnow_authenticate_peer(const uint8_t *mac_addr) {
 
   // Create simple auth message
   uint8_t msg[18]; // 1 byte type + 1 byte len + up to 16 bytes key
-  msg[0] = ESPNOW_AUTH;
+  msg[0] = ESPNOW_DATA_AUTH;
   size_t key_len = strlen(s_auth_key);
   msg[1] = key_len;
 
   if (key_len > 0) {
     memcpy(msg + 2, s_auth_key, key_len);
-
     // Log the message contents for debugging (careful with sensitive keys)
     ESP_LOGI(TAG, "AUTH: Auth message: type=%d, key_len=%d, total_len=%d",
              msg[0], msg[1], 2 + key_len);
@@ -900,49 +1030,4 @@ esp_err_t espnow_authenticate_peer(const uint8_t *mac_addr) {
   }
 
   return send_result;
-}
-
-bool espnow_is_peer_initiator(const uint8_t *mac_addr) {
-  if (mac_addr == NULL) {
-    return false;
-  }
-
-  for (int i = 0; i < s_auth_initiator_count; i++) {
-    if (memcmp(s_auth_initiators[i], mac_addr, ESP_NOW_ETH_ALEN) == 0) {
-      return true;
-    }
-  }
-  return false;
-}
-
-esp_err_t espnow_broadcast_auth(void) {
-  // Create authentication broadcast message (simple structure)
-  // Format: type (1 byte) + auth key (remaining bytes)
-  size_t key_len = strlen(s_auth_key);
-  size_t msg_len = 1 + key_len; // 1 byte type + key
-
-  uint8_t *msg = malloc(msg_len);
-  if (msg == NULL) {
-    ESP_LOGE(TAG, "SIMPLE-AUTH: Failed to allocate memory for auth message");
-    return ESP_ERR_NO_MEM;
-  }
-
-  // Fill message
-  msg[0] = ESPNOW_AUTH;
-  memcpy(msg + 1, s_auth_key, key_len);
-
-  ESP_LOGI(TAG, "SIMPLE-AUTH: Broadcasting auth message with key '%s'",
-           s_auth_key);
-
-  // Send as broadcast
-  esp_err_t ret = esp_now_send(ESPNOW_BROADCAST_MAC, msg, msg_len);
-  if (ret != ESP_OK) {
-    ESP_LOGE(TAG, "SIMPLE-AUTH: Failed to send broadcast auth: %s",
-             esp_err_to_name(ret));
-  } else {
-    ESP_LOGI(TAG, "SIMPLE-AUTH: Broadcast auth sent successfully");
-  }
-
-  free(msg);
-  return ret;
 }

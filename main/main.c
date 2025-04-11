@@ -144,8 +144,12 @@ void app_main(void) {
       .send_cb = on_data_sent,     // Callback for sent data
 
       // Authentication settings
-      .require_auth = true, // Enable authentication
-      .auth_key = "AIR4201" // Set authentication key
+      .require_auth = true,               // Enable authentication
+      .auth_key = "AIR4201",              // Set authentication key
+      .auth_broadcast_interval_ms = 10000 // Set authentication key
+
+      // .discovery_timeout_ms; // Timeout for peer discovery in milliseconds
+      // .max_auth_attempts;     // Maximum authentication attempts per peer
   };
 
   // Initialize ESP-NOW

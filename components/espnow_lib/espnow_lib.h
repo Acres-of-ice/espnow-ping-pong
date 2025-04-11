@@ -26,17 +26,20 @@ extern "C" {
 /** Maximum PCB name length */
 #define ESPNOW_MAX_PCB_NAME_LENGTH 20
 
-/** Broadcast MAC address */
-extern const uint8_t ESPNOW_BROADCAST_MAC[ESP_NOW_ETH_ALEN];
-
-/** Message types */
+/** Message type definitions */
 typedef enum {
   ESPNOW_DATA_BROADCAST,
   ESPNOW_DATA_UNICAST,
   ESPNOW_DATA_MAX,
 } espnow_data_type_t;
 
-/** Callback types */
+/** Authentication message type */
+#define ESPNOW_DATA_AUTH 3
+
+/** Simple broadcast authentication message type */
+#define ESPNOW_AUTH 4
+
+/** Event callback types */
 typedef enum {
   ESPNOW_SEND_CB,
   ESPNOW_RECV_CB,
@@ -101,10 +104,17 @@ typedef struct {
   espnow_recv_cb_t recv_cb; // User callback for received data
   espnow_send_cb_t send_cb; // User callback for send status
 
-  // New authentication fields
-  bool require_auth;    // Whether to require authentication
-  const char *auth_key; // Authentication key (NULL to disable)
+  // Authentication settings
+  bool require_auth;                   // Whether to require authentication
+  const char *auth_key;                // Authentication key (NULL to disable)
+  uint32_t auth_broadcast_interval_ms; // Interval for periodic auth broadcasts
+                                       // (0 to disable)
+  uint32_t discovery_timeout_ms; // Timeout for peer discovery in milliseconds
+  uint8_t max_auth_attempts;     // Maximum authentication attempts per peer
 } espnow_config_t;
+
+/** Broadcast MAC address */
+extern const uint8_t ESPNOW_BROADCAST_MAC[ESP_NOW_ETH_ALEN];
 
 /**
  * @brief Initialize the ESP-NOW library with the given configuration
@@ -198,12 +208,36 @@ esp_err_t espnow_add_trusted_peer(const uint8_t *mac_addr);
  */
 bool espnow_is_trusted_peer(const uint8_t *mac_addr);
 
-// Add this to your espnow_data_type_t enum (if using enum) or define separately
-#define ESPNOW_AUTH 4 // Broadcast authentication message type
-
-// Authentication functions
+/**
+ * @brief Authenticate a peer with the configured authentication key
+ *
+ * @param mac_addr MAC address of the peer to authenticate
+ * @return esp_err_t ESP_OK on success, or an error code
+ */
 esp_err_t espnow_authenticate_peer(const uint8_t *mac_addr);
+
+/**
+ * @brief Check if a peer is authenticated
+ *
+ * @param mac_addr MAC address to check
+ * @return bool true if authenticated, false otherwise
+ */
 bool espnow_is_authenticated(const uint8_t *mac_addr);
+
+/**
+ * @brief Check if a peer initiated the authentication process
+ *
+ * @param mac_addr MAC address to check
+ * @return bool true if initiator, false otherwise
+ */
+bool espnow_is_peer_initiator(const uint8_t *mac_addr);
+
+/**
+ * @brief Broadcast authentication information to all peers
+ *
+ * @return esp_err_t ESP_OK on success, or an error code
+ */
+esp_err_t espnow_broadcast_auth(void);
 
 #ifdef __cplusplus
 }
